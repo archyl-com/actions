@@ -31,6 +31,14 @@ inputs:
     description: 'Target environment name (e.g. production, staging). Auto-created if missing.'
     required: false
     default: ''
+  container-id:
+    description: 'Archyl container UUID to associate with this release'
+    required: false
+    default: ''
+  system-id:
+    description: 'Archyl system UUID to associate with this release'
+    required: false
+    default: ''
   source-url:
     description: 'URL back to the source (commit, release page, etc.)'
     required: false

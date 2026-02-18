@@ -27566,6 +27566,8 @@ async function run() {
   const status = core.getInput("status") || "deployed";
   const changelog = core.getInput("changelog") || "";
   const environment = core.getInput("environment") || "";
+  const containerId = core.getInput("container-id") || "";
+  const systemId = core.getInput("system-id") || "";
   const sourceUrl =
     core.getInput("source-url") ||
     `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
@@ -27577,10 +27579,13 @@ async function run() {
 
   const body = { version, status, source: "github_action" };
   if (changelog) body.changelog = changelog;
+  if (containerId) body.containerId = containerId;
   if (environment) body.environment = environment;
   if (sourceUrl) body.sourceUrl = sourceUrl;
+  if (systemId) body.systemId = systemId;
 
-  const url = `${apiUrl.replace(/\/+$/, "")}/api/v1/projects/${projectId}/releases/ingest`;
+  const base = apiUrl.replace(/\/+$/, "");
+  const url = `${base}/api/v1/projects/${projectId}/releases/ingest`;
 
   const http = new HttpClient("archyl-release-action");
   const response = await http.postJson(url, body, {
