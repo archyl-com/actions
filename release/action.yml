@@ -1,0 +1,45 @@
+name: 'Archyl Release'
+description: 'Create or update a release in Archyl from your CI pipeline'
+branding:
+  icon: 'upload-cloud'
+  color: 'purple'
+
+inputs:
+  api-url:
+    description: 'Archyl API base URL'
+    required: false
+    default: 'https://api.archyl.com'
+  api-key:
+    description: 'Archyl API key with write scope'
+    required: true
+  project-id:
+    description: 'Archyl project UUID'
+    required: true
+  version:
+    description: 'Release version (defaults to GITHUB_REF_NAME)'
+    required: false
+    default: ''
+  status:
+    description: 'Release status: planned, in_progress, deployed, rolled_back, failed'
+    required: false
+    default: 'deployed'
+  changelog:
+    description: 'Release changelog or description'
+    required: false
+    default: ''
+  environment:
+    description: 'Target environment name (e.g. production, staging). Auto-created if missing.'
+    required: false
+    default: ''
+  source-url:
+    description: 'URL back to the source (commit, release page, etc.)'
+    required: false
+    default: ''
+
+outputs:
+  release-id:
+    description: 'UUID of the created or updated release'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
