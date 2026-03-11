@@ -1,0 +1,37 @@
+name: 'Archyl Sync'
+description: 'Sync your archyl.yaml architecture file with Archyl'
+branding:
+  icon: 'refresh-cw'
+  color: 'purple'
+
+inputs:
+  api-url:
+    description: 'Archyl API base URL'
+    required: false
+    default: 'https://api.archyl.com'
+  api-key:
+    description: 'Archyl API key with write scope'
+    required: true
+  project-id:
+    description: 'Archyl project UUID'
+    required: true
+  file:
+    description: 'Path to the archyl.yaml file relative to the repository root'
+    required: false
+    default: 'archyl.yaml'
+
+outputs:
+  systems-created:
+    description: 'Number of systems created'
+  containers-created:
+    description: 'Number of containers created'
+  components-created:
+    description: 'Number of components created'
+  relationships-created:
+    description: 'Number of relationships created'
+  summary:
+    description: 'Human-readable summary of the sync result'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
