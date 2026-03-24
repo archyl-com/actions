@@ -1,0 +1,52 @@
+name: 'Archyl Drift Score'
+description: 'Compute architecture drift score in Archyl and optionally fail the build if it drops below a threshold'
+branding:
+  icon: 'activity'
+  color: 'purple'
+
+inputs:
+  api-url:
+    description: 'Archyl API base URL'
+    required: false
+    default: 'https://api.archyl.com'
+  api-key:
+    description: 'Archyl API key with write scope'
+    required: true
+  organization-id:
+    description: 'Archyl organization UUID'
+    required: true
+  project-id:
+    description: 'Archyl project UUID'
+    required: true
+  threshold:
+    description: 'Minimum acceptable drift score (0-100). The action fails if the score is below this value. Set to 0 to never fail.'
+    required: false
+    default: '0'
+  poll-interval:
+    description: 'Seconds between status polls while waiting for computation'
+    required: false
+    default: '5'
+  poll-timeout:
+    description: 'Maximum seconds to wait for computation to complete'
+    required: false
+    default: '300'
+
+outputs:
+  score:
+    description: 'Drift score (0-100)'
+  score-id:
+    description: 'UUID of the drift score record'
+  total-elements:
+    description: 'Total number of elements compared'
+  matched-count:
+    description: 'Number of matched elements'
+  missing-in-code:
+    description: 'Number of elements missing in code'
+  new-in-code:
+    description: 'Number of new elements found in code'
+  status:
+    description: 'Computation status (completed or failed)'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
