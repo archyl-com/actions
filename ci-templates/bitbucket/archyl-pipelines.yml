@@ -1,0 +1,357 @@
+# Archyl Bitbucket Pipelines Template
+# Copy this into your bitbucket-pipelines.yml or reference it as a template.
+#
+# Required repository variables (Settings > Repository variables):
+#   ARCHYL_API_KEY       - Archyl API key (secured)
+#   ARCHYL_ORG_ID        - Archyl organization UUID
+#   ARCHYL_PROJECT_ID    - Archyl project UUID
+#
+# Optional variables:
+#   ARCHYL_API_URL       - API base URL (default: https://api.archyl.com)
+#   ARCHYL_DRIFT_THRESHOLD - Minimum drift score 0-100 (default: 0)
+
+definitions:
+  scripts:
+    - script: &install-deps
+        apk add --no-cache curl jq git
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: "Archyl Conformance Check"
+          image: alpine:3.20
+          script:
+            - apk add --no-cache curl jq git
+            - |
+              set -euo pipefail
+
+              echo "--- Archyl Conformance Check ---"
+
+              ARCHYL_API_URL="${ARCHYL_API_URL:-https://api.archyl.com}"
+
+              # Validate required variables
+              for var in ARCHYL_API_KEY ARCHYL_ORG_ID ARCHYL_PROJECT_ID; do
+                if [ -z "$(eval echo "\$$var")" ]; then
+                  echo "ERROR: $var is not set"
+                  exit 1
+                fi
+              done
+
+              # Get changed files from the pull request
+              CHANGED_FILES=$(git diff --name-status "origin/${BITBUCKET_PR_DESTINATION_BRANCH}...HEAD" | awk '{print $2}')
+
+              if [ -z "$CHANGED_FILES" ]; then
+                echo "No changed files detected. Skipping conformance check."
+                exit 0
+              fi
+
+              echo "Changed files:"
+              echo "$CHANGED_FILES"
+
+              # Build file contents payload
+              FILE_CONTENTS="[]"
+              CHANGED_FILES_JSON="[]"
+
+              while IFS= read -r file; do
+                if [ -f "$file" ]; then
+                  CONTENT=$(head -200 "$file" | jq -Rs .)
+                  FILE_CONTENTS=$(echo "$FILE_CONTENTS" | jq --arg path "$file" --argjson content "$CONTENT" '. + [{"path": $path, "content": $content}]')
+                fi
+                CHANGED_FILES_JSON=$(echo "$CHANGED_FILES_JSON" | jq --arg path "$file" '. + [$path]')
+              done <<EOF
+              $CHANGED_FILES
+              EOF
+
+              # Trigger conformance check
+              RESPONSE=$(curl -sf -w "\n%{http_code}" \
+                -X POST "${ARCHYL_API_URL}/api/v1/conformance/check" \
+                -H "Content-Type: application/json" \
+                -H "X-API-Key: ${ARCHYL_API_KEY}" \
+                -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+                -d "$(jq -n \
+                  --arg projectId "$ARCHYL_PROJECT_ID" \
+                  --argjson changedFiles "$CHANGED_FILES_JSON" \
+                  --argjson fileContents "$FILE_CONTENTS" \
+                  '{projectId: $projectId, changedFiles: $changedFiles, fileContents: $fileContents}'
+                )" 2>&1) || true
+
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+                echo "ERROR: Conformance check API returned HTTP $HTTP_CODE"
+                echo "$BODY"
+                exit 1
+              fi
+
+              CHECK_ID=$(echo "$BODY" | jq -r '.checkId // .id // empty')
+
+              if [ -z "$CHECK_ID" ]; then
+                echo "ERROR: No check ID returned from API"
+                echo "$BODY"
+                exit 1
+              fi
+
+              echo "Check ID: $CHECK_ID"
+
+              # Poll for report
+              MAX_ATTEMPTS=60
+              ATTEMPT=0
+
+              while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+                REPORT=$(curl -sf \
+                  -H "X-API-Key: ${ARCHYL_API_KEY}" \
+                  -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+                  "${ARCHYL_API_URL}/api/v1/conformance/${CHECK_ID}/report" 2>&1) || true
+
+                STATUS=$(echo "$REPORT" | jq -r '.status // "pending"')
+
+                if [ "$STATUS" = "completed" ] || [ "$STATUS" = "done" ]; then
+                  break
+                fi
+
+                ATTEMPT=$((ATTEMPT + 1))
+                sleep 5
+              done
+
+              if [ "$STATUS" != "completed" ] && [ "$STATUS" != "done" ]; then
+                echo "ERROR: Conformance check timed out after $((MAX_ATTEMPTS * 5))s"
+                exit 1
+              fi
+
+              # Extract results
+              TOTAL=$(echo "$REPORT" | jq -r '.totalViolations // (.violations | length) // 0')
+              ERRORS=$(echo "$REPORT" | jq -r '.errors // ([.violations[]? | select(.severity == "error")] | length) // 0')
+              WARNINGS=$(echo "$REPORT" | jq -r '.warnings // ([.violations[]? | select(.severity == "warning")] | length) // 0')
+
+              echo ""
+              echo "Results: $TOTAL violation(s) ($ERRORS error(s), $WARNINGS warning(s))"
+
+              # Build PR comment
+              COMMENT="## Archyl Conformance Check\n\n"
+
+              if [ "$TOTAL" -eq 0 ]; then
+                COMMENT="${COMMENT}All conformance rules passed.\n"
+              else
+                COMMENT="${COMMENT}| Severity | Count |\n|----------|-------|\n"
+                COMMENT="${COMMENT}| Errors   | $ERRORS |\n"
+                COMMENT="${COMMENT}| Warnings | $WARNINGS |\n\n"
+
+                VIOLATIONS=$(echo "$REPORT" | jq -r '.violations[]? | "- **\(.severity)**: \(.message) (`\(.file // "N/A")`)"')
+                if [ -n "$VIOLATIONS" ]; then
+                  COMMENT="${COMMENT}### Violations\n\n${VIOLATIONS}\n"
+                fi
+              fi
+
+              COMMENT="${COMMENT}\n---\n*Powered by [Archyl](https://archyl.com)*"
+
+              # Post comment on PR via Bitbucket API
+              if [ -n "${BITBUCKET_PR_ID:-}" ]; then
+                BB_API="https://api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_FULL_NAME}/pullrequests/${BITBUCKET_PR_ID}/comments"
+
+                printf '%b' "$COMMENT" | jq -Rs '{content: {raw: .}}' | curl -sf \
+                  -X POST "$BB_API" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${BITBUCKET_ACCESS_TOKEN:-}" \
+                  -d @- > /dev/null 2>&1 || echo "WARNING: Failed to post PR comment"
+              fi
+
+              # Fail on errors
+              if [ "$ERRORS" -gt 0 ]; then
+                echo "FAILED: $ERRORS conformance error(s) found"
+                exit 1
+              fi
+
+              echo "Conformance check passed."
+
+      - step:
+          name: "Archyl Drift Score"
+          image: alpine:3.20
+          script:
+            - apk add --no-cache curl jq
+            - |
+              set -euo pipefail
+
+              echo "--- Archyl Drift Score ---"
+
+              ARCHYL_API_URL="${ARCHYL_API_URL:-https://api.archyl.com}"
+              ARCHYL_DRIFT_THRESHOLD="${ARCHYL_DRIFT_THRESHOLD:-0}"
+
+              # Validate required variables
+              for var in ARCHYL_API_KEY ARCHYL_ORG_ID ARCHYL_PROJECT_ID; do
+                if [ -z "$(eval echo "\$$var")" ]; then
+                  echo "ERROR: $var is not set"
+                  exit 1
+                fi
+              done
+
+              # Trigger drift computation
+              RESPONSE=$(curl -sf -w "\n%{http_code}" \
+                -X POST "${ARCHYL_API_URL}/api/v1/drift/compute" \
+                -H "Content-Type: application/json" \
+                -H "X-API-Key: ${ARCHYL_API_KEY}" \
+                -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+                -d "$(jq -n --arg projectId "$ARCHYL_PROJECT_ID" '{projectId: $projectId}')" 2>&1) || true
+
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+                echo "ERROR: Drift compute API returned HTTP $HTTP_CODE"
+                echo "$BODY"
+                exit 1
+              fi
+
+              SCORE_ID=$(echo "$BODY" | jq -r '.scoreId // .id // empty')
+
+              if [ -z "$SCORE_ID" ]; then
+                echo "ERROR: No score ID returned from API"
+                echo "$BODY"
+                exit 1
+              fi
+
+              echo "Score ID: $SCORE_ID"
+
+              # Poll for result
+              MAX_ATTEMPTS=60
+              ATTEMPT=0
+
+              while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+                RESULT=$(curl -sf \
+                  -H "X-API-Key: ${ARCHYL_API_KEY}" \
+                  -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+                  "${ARCHYL_API_URL}/api/v1/drift/${SCORE_ID}" 2>&1) || true
+
+                STATUS=$(echo "$RESULT" | jq -r '.status // "pending"')
+
+                if [ "$STATUS" = "completed" ] || [ "$STATUS" = "done" ]; then
+                  break
+                fi
+
+                ATTEMPT=$((ATTEMPT + 1))
+                sleep 5
+              done
+
+              if [ "$STATUS" != "completed" ] && [ "$STATUS" != "done" ]; then
+                echo "ERROR: Drift computation timed out after $((MAX_ATTEMPTS * 5))s"
+                exit 1
+              fi
+
+              # Extract results
+              SCORE=$(echo "$RESULT" | jq -r '.score // 0')
+              TOTAL_ELEMENTS=$(echo "$RESULT" | jq -r '.totalElements // 0')
+              MATCHED=$(echo "$RESULT" | jq -r '.matchedCount // 0')
+              MISSING_IN_CODE=$(echo "$RESULT" | jq -r '.missingInCode // 0')
+              NEW_IN_CODE=$(echo "$RESULT" | jq -r '.newInCode // 0')
+
+              echo ""
+              echo "Drift Score: $SCORE / 100"
+              echo "Elements: $TOTAL_ELEMENTS total, $MATCHED matched, $MISSING_IN_CODE missing in code, $NEW_IN_CODE new in code"
+
+              # Build PR comment
+              THRESHOLD="$ARCHYL_DRIFT_THRESHOLD"
+
+              if [ "$SCORE" -ge "$THRESHOLD" ]; then
+                STATUS_ICON="PASSED"
+              else
+                STATUS_ICON="FAILED"
+              fi
+
+              COMMENT="## Archyl Drift Score\n\n"
+              COMMENT="${COMMENT}**Score: ${SCORE} / 100** (threshold: ${THRESHOLD}) -- ${STATUS_ICON}\n\n"
+              COMMENT="${COMMENT}| Metric | Value |\n|--------|-------|\n"
+              COMMENT="${COMMENT}| Total elements | $TOTAL_ELEMENTS |\n"
+              COMMENT="${COMMENT}| Matched | $MATCHED |\n"
+              COMMENT="${COMMENT}| Missing in code | $MISSING_IN_CODE |\n"
+              COMMENT="${COMMENT}| New in code | $NEW_IN_CODE |\n"
+              COMMENT="${COMMENT}\n---\n*Powered by [Archyl](https://archyl.com)*"
+
+              # Post comment on PR via Bitbucket API
+              if [ -n "${BITBUCKET_PR_ID:-}" ]; then
+                BB_API="https://api.bitbucket.org/2.0/repositories/${BITBUCKET_REPO_FULL_NAME}/pullrequests/${BITBUCKET_PR_ID}/comments"
+
+                printf '%b' "$COMMENT" | jq -Rs '{content: {raw: .}}' | curl -sf \
+                  -X POST "$BB_API" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${BITBUCKET_ACCESS_TOKEN:-}" \
+                  -d @- > /dev/null 2>&1 || echo "WARNING: Failed to post PR comment"
+              fi
+
+              # Enforce threshold
+              if [ "$SCORE" -lt "$THRESHOLD" ]; then
+                echo "FAILED: Drift score $SCORE is below threshold $THRESHOLD"
+                exit 1
+              fi
+
+              echo "Drift score check passed."
+
+  branches:
+    main:
+      - step:
+          name: "Archyl Generate Context"
+          image: alpine:3.20
+          script:
+            - apk add --no-cache curl jq git
+            - |
+              set -euo pipefail
+
+              echo "--- Archyl Generate Context ---"
+
+              ARCHYL_API_URL="${ARCHYL_API_URL:-https://api.archyl.com}"
+
+              # Validate required variables
+              for var in ARCHYL_API_KEY ARCHYL_ORG_ID ARCHYL_PROJECT_ID; do
+                if [ -z "$(eval echo "\$$var")" ]; then
+                  echo "ERROR: $var is not set"
+                  exit 1
+                fi
+              done
+
+              # Fetch architecture context
+              RESPONSE=$(curl -sf -w "\n%{http_code}" \
+                -X POST "${ARCHYL_API_URL}/api/v1/projects/${ARCHYL_PROJECT_ID}/agent-context" \
+                -H "Content-Type: application/json" \
+                -H "X-API-Key: ${ARCHYL_API_KEY}" \
+                -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+                -d '{"format": "markdown"}' 2>&1) || true
+
+              HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+
+              if [ "$HTTP_CODE" != "200" ]; then
+                echo "ERROR: Agent context API returned HTTP $HTTP_CODE"
+                echo "$BODY"
+                exit 1
+              fi
+
+              # Extract content and write to file
+              CONTENT=$(echo "$BODY" | jq -r '.content // .context // empty')
+
+              if [ -z "$CONTENT" ]; then
+                echo "ERROR: No context content returned"
+                echo "$BODY"
+                exit 1
+              fi
+
+              OUTPUT_FILE="${ARCHYL_CONTEXT_FILE:-archyl.txt}"
+              echo "$CONTENT" > "$OUTPUT_FILE"
+
+              echo "Generated $OUTPUT_FILE ($(wc -c < "$OUTPUT_FILE") bytes)"
+
+              # Commit and push if content changed
+              git diff --quiet "$OUTPUT_FILE" 2>/dev/null && {
+                echo "No changes to $OUTPUT_FILE. Skipping commit."
+                exit 0
+              } || true
+
+              git config user.email "archyl-bot@archyl.com"
+              git config user.name "Archyl Bot"
+              git add "$OUTPUT_FILE"
+              git commit -m "chore: update $OUTPUT_FILE architecture context"
+              git push origin "${BITBUCKET_BRANCH}" || {
+                echo "ERROR: Failed to push changes. Ensure the pipeline has write access."
+                exit 1
+              }
+
+              echo "Committed and pushed updated $OUTPUT_FILE."

@@ -1,0 +1,362 @@
+# Archyl GitLab CI Template
+# Include this template in your .gitlab-ci.yml to integrate Archyl architecture checks.
+#
+# Usage:
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/archyl-com/actions/main/ci-templates/gitlab/.archyl-ci.yml'
+#
+# Required CI/CD variables:
+#   ARCHYL_API_KEY       - Archyl API key (masked, protected)
+#   ARCHYL_ORG_ID        - Archyl organization UUID
+#   ARCHYL_PROJECT_ID    - Archyl project UUID
+#
+# Optional variables:
+#   ARCHYL_API_URL       - API base URL (default: https://api.archyl.com)
+#   ARCHYL_DRIFT_THRESHOLD - Minimum drift score 0-100 (default: 0)
+
+variables:
+  ARCHYL_API_URL: "https://api.archyl.com"
+  ARCHYL_DRIFT_THRESHOLD: "0"
+
+.archyl_base:
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache curl jq git
+
+archyl:conformance:
+  extends: .archyl_base
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - |
+      set -euo pipefail
+
+      echo "--- Archyl Conformance Check ---"
+
+      # Validate required variables
+      for var in ARCHYL_API_KEY ARCHYL_ORG_ID ARCHYL_PROJECT_ID; do
+        if [ -z "$(eval echo "\$$var")" ]; then
+          echo "ERROR: $var is not set"
+          exit 1
+        fi
+      done
+
+      # Get changed files from the merge request diff
+      CHANGED_FILES=$(git diff --name-status "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}...HEAD" | awk '{print $2}')
+
+      if [ -z "$CHANGED_FILES" ]; then
+        echo "No changed files detected. Skipping conformance check."
+        exit 0
+      fi
+
+      echo "Changed files:"
+      echo "$CHANGED_FILES"
+
+      # Build file contents payload
+      FILE_CONTENTS="[]"
+      CHANGED_FILES_JSON="[]"
+
+      while IFS= read -r file; do
+        if [ -f "$file" ]; then
+          CONTENT=$(head -200 "$file" | jq -Rs .)
+          FILE_CONTENTS=$(echo "$FILE_CONTENTS" | jq --arg path "$file" --argjson content "$CONTENT" '. + [{"path": $path, "content": $content}]')
+        fi
+        CHANGED_FILES_JSON=$(echo "$CHANGED_FILES_JSON" | jq --arg path "$file" '. + [$path]')
+      done <<EOF
+      $CHANGED_FILES
+      EOF
+
+      # Trigger conformance check
+      RESPONSE=$(curl -sf -w "\n%{http_code}" \
+        -X POST "${ARCHYL_API_URL}/api/v1/conformance/check" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${ARCHYL_API_KEY}" \
+        -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+        -d "$(jq -n \
+          --arg projectId "$ARCHYL_PROJECT_ID" \
+          --argjson changedFiles "$CHANGED_FILES_JSON" \
+          --argjson fileContents "$FILE_CONTENTS" \
+          '{projectId: $projectId, changedFiles: $changedFiles, fileContents: $fileContents}'
+        )" 2>&1) || true
+
+      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+      BODY=$(echo "$RESPONSE" | sed '$d')
+
+      if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+        echo "ERROR: Conformance check API returned HTTP $HTTP_CODE"
+        echo "$BODY"
+        exit 1
+      fi
+
+      CHECK_ID=$(echo "$BODY" | jq -r '.checkId // .id // empty')
+
+      if [ -z "$CHECK_ID" ]; then
+        echo "ERROR: No check ID returned from API"
+        echo "$BODY"
+        exit 1
+      fi
+
+      echo "Check ID: $CHECK_ID"
+
+      # Poll for report
+      MAX_ATTEMPTS=60
+      ATTEMPT=0
+
+      while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        REPORT=$(curl -sf \
+          -H "X-API-Key: ${ARCHYL_API_KEY}" \
+          -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+          "${ARCHYL_API_URL}/api/v1/conformance/${CHECK_ID}/report" 2>&1) || true
+
+        STATUS=$(echo "$REPORT" | jq -r '.status // "pending"')
+
+        if [ "$STATUS" = "completed" ] || [ "$STATUS" = "done" ]; then
+          break
+        fi
+
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 5
+      done
+
+      if [ "$STATUS" != "completed" ] && [ "$STATUS" != "done" ]; then
+        echo "ERROR: Conformance check timed out after $((MAX_ATTEMPTS * 5))s"
+        exit 1
+      fi
+
+      # Extract results
+      TOTAL=$(echo "$REPORT" | jq -r '.totalViolations // (.violations | length) // 0')
+      ERRORS=$(echo "$REPORT" | jq -r '.errors // ([.violations[]? | select(.severity == "error")] | length) // 0')
+      WARNINGS=$(echo "$REPORT" | jq -r '.warnings // ([.violations[]? | select(.severity == "warning")] | length) // 0')
+
+      echo ""
+      echo "Results: $TOTAL violation(s) ($ERRORS error(s), $WARNINGS warning(s))"
+
+      # Build MR comment
+      COMMENT="## Archyl Conformance Check\n\n"
+
+      if [ "$TOTAL" -eq 0 ]; then
+        COMMENT="${COMMENT}All conformance rules passed.\n"
+      else
+        COMMENT="${COMMENT}| Severity | Count |\n|----------|-------|\n"
+        COMMENT="${COMMENT}| Errors   | $ERRORS |\n"
+        COMMENT="${COMMENT}| Warnings | $WARNINGS |\n\n"
+
+        # List violations
+        VIOLATIONS=$(echo "$REPORT" | jq -r '.violations[]? | "- **\(.severity)**: \(.message) (`\(.file // "N/A")`)"')
+        if [ -n "$VIOLATIONS" ]; then
+          COMMENT="${COMMENT}### Violations\n\n${VIOLATIONS}\n"
+        fi
+      fi
+
+      COMMENT="${COMMENT}\n---\n*Powered by [Archyl](https://archyl.com)*"
+
+      # Post comment on MR via GitLab API
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ] && [ -n "${GITLAB_TOKEN:-${CI_JOB_TOKEN:-}}" ]; then
+        GL_TOKEN="${GITLAB_TOKEN:-$CI_JOB_TOKEN}"
+        GL_API="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
+
+        printf '%b' "$COMMENT" | jq -Rs '{body: .}' | curl -sf \
+          -X POST "$GL_API" \
+          -H "PRIVATE-TOKEN: $GL_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d @- > /dev/null 2>&1 || echo "WARNING: Failed to post MR comment"
+      fi
+
+      # Fail on errors
+      if [ "$ERRORS" -gt 0 ]; then
+        echo "FAILED: $ERRORS conformance error(s) found"
+        exit 1
+      fi
+
+      echo "Conformance check passed."
+
+archyl:drift-score:
+  extends: .archyl_base
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - |
+      set -euo pipefail
+
+      echo "--- Archyl Drift Score ---"
+
+      # Validate required variables
+      for var in ARCHYL_API_KEY ARCHYL_ORG_ID ARCHYL_PROJECT_ID; do
+        if [ -z "$(eval echo "\$$var")" ]; then
+          echo "ERROR: $var is not set"
+          exit 1
+        fi
+      done
+
+      # Trigger drift computation
+      RESPONSE=$(curl -sf -w "\n%{http_code}" \
+        -X POST "${ARCHYL_API_URL}/api/v1/drift/compute" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${ARCHYL_API_KEY}" \
+        -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+        -d "$(jq -n --arg projectId "$ARCHYL_PROJECT_ID" '{projectId: $projectId}')" 2>&1) || true
+
+      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+      BODY=$(echo "$RESPONSE" | sed '$d')
+
+      if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+        echo "ERROR: Drift compute API returned HTTP $HTTP_CODE"
+        echo "$BODY"
+        exit 1
+      fi
+
+      SCORE_ID=$(echo "$BODY" | jq -r '.scoreId // .id // empty')
+
+      if [ -z "$SCORE_ID" ]; then
+        echo "ERROR: No score ID returned from API"
+        echo "$BODY"
+        exit 1
+      fi
+
+      echo "Score ID: $SCORE_ID"
+
+      # Poll for result
+      MAX_ATTEMPTS=60
+      ATTEMPT=0
+
+      while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        RESULT=$(curl -sf \
+          -H "X-API-Key: ${ARCHYL_API_KEY}" \
+          -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+          "${ARCHYL_API_URL}/api/v1/drift/${SCORE_ID}" 2>&1) || true
+
+        STATUS=$(echo "$RESULT" | jq -r '.status // "pending"')
+
+        if [ "$STATUS" = "completed" ] || [ "$STATUS" = "done" ]; then
+          break
+        fi
+
+        ATTEMPT=$((ATTEMPT + 1))
+        sleep 5
+      done
+
+      if [ "$STATUS" != "completed" ] && [ "$STATUS" != "done" ]; then
+        echo "ERROR: Drift computation timed out after $((MAX_ATTEMPTS * 5))s"
+        exit 1
+      fi
+
+      # Extract results
+      SCORE=$(echo "$RESULT" | jq -r '.score // 0')
+      TOTAL_ELEMENTS=$(echo "$RESULT" | jq -r '.totalElements // 0')
+      MATCHED=$(echo "$RESULT" | jq -r '.matchedCount // 0')
+      MISSING_IN_CODE=$(echo "$RESULT" | jq -r '.missingInCode // 0')
+      NEW_IN_CODE=$(echo "$RESULT" | jq -r '.newInCode // 0')
+
+      echo ""
+      echo "Drift Score: $SCORE / 100"
+      echo "Elements: $TOTAL_ELEMENTS total, $MATCHED matched, $MISSING_IN_CODE missing in code, $NEW_IN_CODE new in code"
+
+      # Build MR comment
+      THRESHOLD="${ARCHYL_DRIFT_THRESHOLD:-0}"
+
+      if [ "$SCORE" -ge "$THRESHOLD" ]; then
+        STATUS_ICON="PASSED"
+      else
+        STATUS_ICON="FAILED"
+      fi
+
+      COMMENT="## Archyl Drift Score\n\n"
+      COMMENT="${COMMENT}**Score: ${SCORE} / 100** (threshold: ${THRESHOLD}) -- ${STATUS_ICON}\n\n"
+      COMMENT="${COMMENT}| Metric | Value |\n|--------|-------|\n"
+      COMMENT="${COMMENT}| Total elements | $TOTAL_ELEMENTS |\n"
+      COMMENT="${COMMENT}| Matched | $MATCHED |\n"
+      COMMENT="${COMMENT}| Missing in code | $MISSING_IN_CODE |\n"
+      COMMENT="${COMMENT}| New in code | $NEW_IN_CODE |\n"
+      COMMENT="${COMMENT}\n---\n*Powered by [Archyl](https://archyl.com)*"
+
+      # Post comment on MR via GitLab API
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ] && [ -n "${GITLAB_TOKEN:-${CI_JOB_TOKEN:-}}" ]; then
+        GL_TOKEN="${GITLAB_TOKEN:-$CI_JOB_TOKEN}"
+        GL_API="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
+
+        printf '%b' "$COMMENT" | jq -Rs '{body: .}' | curl -sf \
+          -X POST "$GL_API" \
+          -H "PRIVATE-TOKEN: $GL_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d @- > /dev/null 2>&1 || echo "WARNING: Failed to post MR comment"
+      fi
+
+      # Enforce threshold
+      if [ "$SCORE" -lt "$THRESHOLD" ]; then
+        echo "FAILED: Drift score $SCORE is below threshold $THRESHOLD"
+        exit 1
+      fi
+
+      echo "Drift score check passed."
+
+archyl:generate-context:
+  extends: .archyl_base
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - |
+      set -euo pipefail
+
+      echo "--- Archyl Generate Context ---"
+
+      # Validate required variables
+      for var in ARCHYL_API_KEY ARCHYL_ORG_ID ARCHYL_PROJECT_ID; do
+        if [ -z "$(eval echo "\$$var")" ]; then
+          echo "ERROR: $var is not set"
+          exit 1
+        fi
+      done
+
+      # Fetch architecture context
+      RESPONSE=$(curl -sf -w "\n%{http_code}" \
+        -X POST "${ARCHYL_API_URL}/api/v1/projects/${ARCHYL_PROJECT_ID}/agent-context" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: ${ARCHYL_API_KEY}" \
+        -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
+        -d '{"format": "markdown"}' 2>&1) || true
+
+      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+      BODY=$(echo "$RESPONSE" | sed '$d')
+
+      if [ "$HTTP_CODE" != "200" ]; then
+        echo "ERROR: Agent context API returned HTTP $HTTP_CODE"
+        echo "$BODY"
+        exit 1
+      fi
+
+      # Extract content and write to file
+      CONTENT=$(echo "$BODY" | jq -r '.content // .context // empty')
+
+      if [ -z "$CONTENT" ]; then
+        echo "ERROR: No context content returned"
+        echo "$BODY"
+        exit 1
+      fi
+
+      OUTPUT_FILE="${ARCHYL_CONTEXT_FILE:-archyl.txt}"
+      echo "$CONTENT" > "$OUTPUT_FILE"
+
+      echo "Generated $OUTPUT_FILE ($(wc -c < "$OUTPUT_FILE") bytes)"
+
+      # Commit and push if content changed
+      git diff --quiet "$OUTPUT_FILE" 2>/dev/null && {
+        echo "No changes to $OUTPUT_FILE. Skipping commit."
+        exit 0
+      } || true
+
+      git config user.email "archyl-bot@archyl.com"
+      git config user.name "Archyl Bot"
+      git add "$OUTPUT_FILE"
+      git commit -m "chore: update $OUTPUT_FILE architecture context"
+
+      # Push using CI job token or deploy token
+      PUSH_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      git push "$PUSH_URL" HEAD:"${CI_COMMIT_BRANCH}" || {
+        echo "ERROR: Failed to push changes. Ensure the CI job token has write access."
+        exit 1
+      }
+
+      echo "Committed and pushed updated $OUTPUT_FILE."

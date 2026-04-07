@@ -1,0 +1,44 @@
+name: 'Archyl Auto Change Request'
+description: 'Automatically create an Architecture Change Request in Archyl when code is merged to main'
+branding:
+  icon: 'git-merge'
+  color: 'purple'
+
+inputs:
+  api-url:
+    description: 'Archyl API base URL'
+    required: false
+    default: 'https://api.archyl.com'
+  api-key:
+    description: 'Archyl API key with write scope'
+    required: true
+  organization-id:
+    description: 'Archyl organization UUID'
+    required: true
+  project-id:
+    description: 'Archyl project UUID'
+    required: true
+  github-token:
+    description: 'GitHub token for commit comments and diff access (defaults to GITHUB_TOKEN)'
+    required: false
+    default: '${{ github.token }}'
+  base-ref:
+    description: 'Base ref to compare against (auto-detected from push event if omitted)'
+    required: false
+    default: ''
+  comment-on-commit:
+    description: 'Post a comment on the merge commit with the Change Request link'
+    required: false
+    default: 'false'
+
+outputs:
+  request-id:
+    description: 'UUID of the created Change Request'
+  changes-detected:
+    description: 'Number of architecture-relevant changes found'
+  status:
+    description: '"created", "skipped" (no changes), or "failed"'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'

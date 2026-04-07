@@ -31837,180 +31837,354 @@ var __webpack_exports__ = {};
 const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
 const { HttpClient } = __nccwpck_require__(4844);
+const fs = __nccwpck_require__(9896);
+const path = __nccwpck_require__(6928);
 
 async function run() {
   const apiUrl = (core.getInput("api-url") || "https://api.archyl.com").replace(/\/+$/, "");
   const apiKey = core.getInput("api-key", { required: true });
   const organizationId = core.getInput("organization-id", { required: true });
   const projectId = core.getInput("project-id", { required: true });
-  const threshold = parseInt(core.getInput("threshold") || "0", 10);
-  const commentOnPr = core.getInput("comment-on-pr") === "true";
+  const failOn = core.getInput("fail-on") || "error";
+  const commentOnPr = core.getInput("comment-on-pr") !== "false";
   const githubToken = core.getInput("github-token");
-  const pollInterval = parseInt(core.getInput("poll-interval") || "5", 10) * 1000;
-  const pollTimeout = parseInt(core.getInput("poll-timeout") || "300", 10) * 1000;
+  const maxFileLines = parseInt(core.getInput("max-file-lines") || "200", 10);
+  const chunkSize = parseInt(core.getInput("chunk-size") || "20", 10);
 
-  const http = new HttpClient("archyl-drift-score-action");
+  const http = new HttpClient("archyl-conformance-check-action");
   const headers = {
     "X-API-Key": apiKey,
     "X-Organization-ID": organizationId,
     "Content-Type": "application/json",
   };
 
-  // Step 1: Trigger drift computation
-  core.info("Triggering drift score computation...");
+  // Step 1: Get changed files from the PR or push
+  const changedFiles = await getChangedFiles(githubToken);
 
-  const computeUrl = `${apiUrl}/api/v1/drift/compute`;
-  const computeResponse = await http.postJson(computeUrl, { projectId }, headers);
-
-  if (computeResponse.statusCode < 200 || computeResponse.statusCode >= 300) {
-    core.setFailed(`Failed to trigger drift computation: ${computeResponse.statusCode} ${JSON.stringify(computeResponse.result)}`);
+  if (changedFiles.length === 0) {
+    core.info("No changed files detected — skipping conformance check.");
+    core.setOutput("total-violations", 0);
+    core.setOutput("errors", 0);
+    core.setOutput("warnings", 0);
+    core.setOutput("infos", 0);
+    core.setOutput("status", "pass");
     return;
   }
 
-  const scoreId = computeResponse.result && computeResponse.result.id;
-  if (!scoreId) {
-    core.setFailed("No score ID returned from drift computation");
-    return;
-  }
+  core.info(`Found ${changedFiles.length} changed file(s).`);
 
-  core.info(`Drift computation started: ${scoreId}`);
+  // Step 2: Read file contents (first N lines per file)
+  const fileContents = readFileContents(changedFiles, maxFileLines);
 
-  // Step 2: Poll until completion
-  const scoreUrl = `${apiUrl}/api/v1/drift/${scoreId}`;
-  const startTime = Date.now();
-  let result = null;
+  // Step 3: Run conformance check (chunked if needed)
+  core.info("Running conformance check...");
 
-  while (Date.now() - startTime < pollTimeout) {
-    const pollResponse = await http.getJson(scoreUrl, headers);
+  let checkId = null;
+  const chunks = chunkArray(changedFiles, chunkSize);
 
-    if (pollResponse.statusCode < 200 || pollResponse.statusCode >= 300) {
-      core.setFailed(`Failed to poll drift score: ${pollResponse.statusCode}`);
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const chunkContents = {};
+    for (const file of chunk) {
+      if (fileContents[file.path]) {
+        chunkContents[file.path] = fileContents[file.path];
+      }
+    }
+
+    const body = {
+      projectId,
+      changedFiles: chunk,
+      fileContents: chunkContents,
+    };
+    if (checkId) {
+      body.checkId = checkId;
+    }
+
+    const url = `${apiUrl}/api/v1/conformance/check`;
+    const response = await http.postJson(url, body, headers);
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      core.setFailed(`Conformance check failed: ${response.statusCode} ${JSON.stringify(response.result)}`);
       return;
     }
 
-    result = pollResponse.result;
-    const status = result && result.status;
-
-    if (status === "completed" || status === "failed") {
-      break;
+    checkId = response.result && response.result.id;
+    if (!checkId) {
+      core.setFailed("No check ID returned from conformance check");
+      return;
     }
 
-    core.info(`Status: ${status} — waiting ${pollInterval / 1000}s...`);
-    await sleep(pollInterval);
+    if (chunks.length > 1) {
+      core.info(`  Chunk ${i + 1}/${chunks.length} sent (${chunk.length} files)`);
+    }
   }
 
-  if (!result || (result.status !== "completed" && result.status !== "failed")) {
-    core.setFailed(`Drift computation timed out after ${pollTimeout / 1000}s`);
+  core.info(`Conformance check completed: ${checkId}`);
+
+  // Step 4: Get the full report
+  const reportUrl = `${apiUrl}/api/v1/conformance/${checkId}/report`;
+  const reportResponse = await http.getJson(reportUrl, headers);
+
+  if (reportResponse.statusCode < 200 || reportResponse.statusCode >= 300) {
+    core.setFailed(`Failed to fetch conformance report: ${reportResponse.statusCode}`);
     return;
   }
 
-  // Step 3: Set outputs
-  core.setOutput("score", result.score);
-  core.setOutput("score-id", result.id);
-  core.setOutput("total-elements", result.totalElements);
-  core.setOutput("matched-count", result.matchedCount);
-  core.setOutput("missing-in-code", result.missingInCode);
-  core.setOutput("new-in-code", result.newInCode);
-  core.setOutput("status", result.status);
+  const report = reportResponse.result;
+  const violations = report.violations || [];
 
-  if (result.status === "failed") {
-    core.setFailed(`Drift computation failed: ${result.errorMessage || "Unknown error"}`);
-    return;
+  // Step 5: Count by severity
+  const counts = { error: 0, warning: 0, info: 0 };
+  for (const v of violations) {
+    const severity = v.severity || "info";
+    counts[severity] = (counts[severity] || 0) + 1;
   }
 
-  // Step 4: Report results
-  const score = result.score;
+  const total = violations.length;
+
+  core.setOutput("check-id", checkId);
+  core.setOutput("total-violations", total);
+  core.setOutput("errors", counts.error);
+  core.setOutput("warnings", counts.warning);
+  core.setOutput("infos", counts.info);
+
+  // Step 6: Create annotations
+  for (const v of violations) {
+    const annotation = {
+      file: v.file || undefined,
+      startLine: v.line || undefined,
+    };
+
+    const message = `[${v.ruleName || "conformance"}] ${v.message}`;
+
+    if (v.severity === "error") {
+      core.error(message, annotation);
+    } else if (v.severity === "warning") {
+      core.warning(message, annotation);
+    } else {
+      core.notice(message, annotation);
+    }
+  }
+
+  // Step 7: Log summary
   core.info("");
-  core.info("╔══════════════════════════════════════╗");
-  core.info(`║  Architecture Drift Score: ${String(score).padStart(3)}%      ║`);
-  core.info("╚══════════════════════════════════════╝");
+  core.info("+" + "-".repeat(44) + "+");
+  core.info(`|  Conformance Check: ${total === 0 ? "PASS" : `${total} violation(s)`}`.padEnd(45) + "|");
+  core.info("+" + "-".repeat(44) + "+");
   core.info("");
-  core.info(`  Matched:         ${result.matchedCount}`);
-  core.info(`  Drifted:         ${result.driftedCount}`);
-  core.info(`  Missing in code: ${result.missingInCode}`);
-  core.info(`  New in code:     ${result.newInCode}`);
-  core.info(`  Total elements:  ${result.totalElements}`);
+  core.info(`  Errors:   ${counts.error}`);
+  core.info(`  Warnings: ${counts.warning}`);
+  core.info(`  Infos:    ${counts.info}`);
   core.info("");
 
-  // Step 5: Write job summary
-  const interpretation = score >= 90 ? "Excellent" : score >= 70 ? "Good" : score >= 50 ? "Fair" : score >= 30 ? "Poor" : "Critical";
-  const emoji = score >= 90 ? "✅" : score >= 70 ? "🟢" : score >= 50 ? "🟡" : score >= 30 ? "🟠" : "🔴";
+  // Step 8: Write job summary
+  const status = shouldFail(failOn, counts) ? "fail" : "pass";
+  const emoji = status === "pass" ? "\u2705" : "\u274c";
 
-  await core.summary
-    .addHeading(`${emoji} Architecture Drift Score: ${score}%`)
-    .addRaw(`**${interpretation}** — ${result.matchedCount} of ${result.totalElements} elements match the documented architecture.\n\n`)
-    .addTable([
-      [{ data: "Metric", header: true }, { data: "Count", header: true }],
-      ["Matched", String(result.matchedCount)],
-      ["Drifted", String(result.driftedCount)],
-      ["Missing in code", String(result.missingInCode)],
-      ["New in code", String(result.newInCode)],
-      ["Total elements", String(result.totalElements)],
-    ])
-    .write();
+  const summaryBuilder = core.summary
+    .addHeading(`${emoji} Conformance Check: ${total} violation(s)`)
+    .addRaw(`**${status === "pass" ? "Passed" : "Failed"}** — ${changedFiles.length} file(s) checked against architecture rules.\n\n`);
 
-  // Step 6: Comment on PR
+  if (total > 0) {
+    const tableRows = [
+      [
+        { data: "Severity", header: true },
+        { data: "Rule", header: true },
+        { data: "File", header: true },
+        { data: "Message", header: true },
+      ],
+    ];
+
+    for (const v of violations) {
+      const severityIcon = v.severity === "error" ? "\ud83d\udd34" : v.severity === "warning" ? "\ud83d\udfe0" : "\ud83d\udfe2";
+      tableRows.push([
+        `${severityIcon} ${v.severity}`,
+        v.ruleName || "-",
+        v.file ? `\`${v.file}\`` : "-",
+        v.message || "-",
+      ]);
+    }
+
+    summaryBuilder.addTable(tableRows);
+  }
+
+  summaryBuilder.addRaw("\n\n---\n*Powered by [Archyl](https://archyl.com) — Architecture Intelligence for AI-Native Teams*\n");
+  await summaryBuilder.write();
+
+  core.setOutput("status", status);
+
+  // Step 9: Comment on PR
   if (commentOnPr && github.context.payload.pull_request && githubToken) {
-    try {
-      const octokit = github.getOctokit(githubToken);
-      const context = github.context;
+    await commentOnPullRequest(githubToken, violations, counts, changedFiles.length, checkId, status);
+  }
 
-      let body = `## ${emoji} Architecture Drift Score: ${score}%\n\n`;
-      body += `**${interpretation}** — ${result.matchedCount} of ${result.totalElements} elements match the documented architecture.\n\n`;
-      body += `| Metric | Count |\n|--------|-------|\n`;
-      body += `| Matched | ${result.matchedCount} |\n`;
-      body += `| Drifted | ${result.driftedCount} |\n`;
-      body += `| Missing in code | ${result.missingInCode} |\n`;
-      body += `| New in code | ${result.newInCode} |\n`;
-      body += `| Total elements | ${result.totalElements} |\n\n`;
-      if (threshold > 0) {
-        body += `**Threshold:** ${threshold}% ${score >= threshold ? "(passed)" : "(failed)"}\n\n`;
+  // Step 10: Fail if needed
+  if (status === "fail") {
+    core.setFailed(
+      `Conformance check failed: ${counts.error} error(s), ${counts.warning} warning(s) (fail-on: ${failOn})`
+    );
+  }
+}
+
+async function getChangedFiles(token) {
+  const context = github.context;
+
+  if (context.payload.pull_request) {
+    const octokit = github.getOctokit(token);
+    const files = [];
+    let page = 1;
+
+    while (true) {
+      const response = await octokit.rest.pulls.listFiles({
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        pull_number: context.payload.pull_request.number,
+        per_page: 100,
+        page,
+      });
+
+      for (const file of response.data) {
+        files.push({
+          path: file.filename,
+          status: mapGitHubStatus(file.status),
+        });
       }
-      body += `---\n*Powered by [Archyl](https://archyl.com) — Architecture Intelligence for AI-Native Teams*`;
 
-      const comments = await octokit.rest.issues.listComments({
+      if (response.data.length < 100) break;
+      page++;
+    }
+
+    return files;
+  }
+
+  // Fallback for push events: use before/after commits
+  if (context.payload.before && context.payload.after) {
+    const octokit = github.getOctokit(token);
+    const response = await octokit.rest.repos.compareCommits({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      base: context.payload.before,
+      head: context.payload.after,
+    });
+
+    return (response.data.files || []).map((file) => ({
+      path: file.filename,
+      status: mapGitHubStatus(file.status),
+    }));
+  }
+
+  return [];
+}
+
+function mapGitHubStatus(ghStatus) {
+  const map = {
+    added: "added",
+    modified: "modified",
+    removed: "deleted",
+    renamed: "modified",
+    copied: "added",
+    changed: "modified",
+  };
+  return map[ghStatus] || "modified";
+}
+
+function readFileContents(changedFiles, maxLines) {
+  const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+  const contents = {};
+
+  for (const file of changedFiles) {
+    if (file.status === "deleted") continue;
+
+    const fullPath = path.join(workspace, file.path);
+    if (!fs.existsSync(fullPath)) continue;
+
+    try {
+      const raw = fs.readFileSync(fullPath, "utf-8");
+      const lines = raw.split("\n").slice(0, maxLines);
+      contents[file.path] = lines.join("\n");
+    } catch {
+      core.warning(`Could not read file: ${file.path}`);
+    }
+  }
+
+  return contents;
+}
+
+function chunkArray(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function shouldFail(failOn, counts) {
+  if (failOn === "none") return false;
+  if (failOn === "error") return counts.error > 0;
+  if (failOn === "warning") return counts.error > 0 || counts.warning > 0;
+  return counts.error > 0;
+}
+
+async function commentOnPullRequest(token, violations, counts, filesChecked, checkId, status) {
+  try {
+    const octokit = github.getOctokit(token);
+    const context = github.context;
+    const total = violations.length;
+    const emoji = status === "pass" ? "\u2705" : "\u274c";
+
+    let body = `## ${emoji} Archyl Conformance Check\n\n`;
+    body += `**${filesChecked}** file(s) checked | `;
+    body += `**${counts.error}** error(s) | **${counts.warning}** warning(s) | **${counts.info}** info(s)\n\n`;
+
+    if (total > 0) {
+      body += "| Severity | Rule | File | Message |\n";
+      body += "|----------|------|------|---------|\n";
+
+      for (const v of violations.slice(0, 25)) {
+        const icon = v.severity === "error" ? "\ud83d\udd34" : v.severity === "warning" ? "\ud83d\udfe0" : "\ud83d\udfe2";
+        body += `| ${icon} ${v.severity} | ${v.ruleName || "-"} | \`${v.file || "-"}\` | ${v.message || "-"} |\n`;
+      }
+
+      if (total > 25) {
+        body += `\n*...and ${total - 25} more violation(s). See the full report in Archyl.*\n`;
+      }
+    } else {
+      body += "> All architecture conformance rules passed.\n";
+    }
+
+    body += "\n---\n*Powered by [Archyl](https://archyl.com) — Architecture Intelligence for AI-Native Teams*";
+
+    // Update existing comment or create new one
+    const comments = await octokit.rest.issues.listComments({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      issue_number: context.payload.pull_request.number,
+    });
+
+    const existing = comments.data.find(
+      (c) => c.body && c.body.includes("Archyl Conformance Check")
+    );
+
+    if (existing) {
+      await octokit.rest.issues.updateComment({
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        comment_id: existing.id,
+        body,
+      });
+      core.info("Updated existing PR comment.");
+    } else {
+      await octokit.rest.issues.createComment({
         owner: context.repo.owner,
         repo: context.repo.repo,
         issue_number: context.payload.pull_request.number,
+        body,
       });
-
-      const existing = comments.data.find(
-        (c) => c.body && c.body.includes("Architecture Drift Score")
-      );
-
-      if (existing) {
-        await octokit.rest.issues.updateComment({
-          owner: context.repo.owner,
-          repo: context.repo.repo,
-          comment_id: existing.id,
-          body,
-        });
-        core.info("Updated existing drift score PR comment.");
-      } else {
-        await octokit.rest.issues.createComment({
-          owner: context.repo.owner,
-          repo: context.repo.repo,
-          issue_number: context.payload.pull_request.number,
-          body,
-        });
-        core.info("Created drift score PR comment.");
-      }
-    } catch (err) {
-      core.warning(`Failed to comment on PR: ${err.message}`);
+      core.info("Created PR comment.");
     }
+  } catch (err) {
+    core.warning(`Failed to comment on PR: ${err.message}`);
   }
-
-  // Step 7: Threshold check
-  if (threshold > 0 && score < threshold) {
-    core.setFailed(`Drift score ${score}% is below threshold ${threshold}%`);
-    return;
-  }
-
-  core.info(`Drift score: ${score}% (threshold: ${threshold > 0 ? threshold + "%" : "disabled"})`);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 run().catch((err) => {

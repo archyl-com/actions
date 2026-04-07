@@ -1,0 +1,82 @@
+name: Archyl PR Checks
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: 'Archyl API base URL'
+        type: string
+        required: false
+        default: 'https://api.archyl.com'
+      organization-id:
+        description: 'Archyl organization UUID'
+        type: string
+        required: true
+      project-id:
+        description: 'Archyl project UUID'
+        type: string
+        required: true
+      drift-threshold:
+        description: 'Minimum acceptable drift score (0-100). Set to 0 to never fail.'
+        type: number
+        required: false
+        default: 0
+      fail-on:
+        description: 'Minimum conformance severity that fails the check: "error", "warning", or "none"'
+        type: string
+        required: false
+        default: 'error'
+      comment-on-pr:
+        description: 'Post summary comments on the pull request'
+        type: boolean
+        required: false
+        default: true
+      max-file-lines:
+        description: 'Maximum lines to send per file for conformance check'
+        type: number
+        required: false
+        default: 200
+      chunk-size:
+        description: 'Number of files to send per conformance API call'
+        type: number
+        required: false
+        default: 20
+    secrets:
+      api-key:
+        description: 'Archyl API key with write scope'
+        required: true
+
+jobs:
+  conformance-check:
+    name: Conformance Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run conformance check
+        uses: archyl-com/actions/conformance-check@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          api-key: ${{ secrets.api-key }}
+          organization-id: ${{ inputs.organization-id }}
+          project-id: ${{ inputs.project-id }}
+          fail-on: ${{ inputs.fail-on }}
+          comment-on-pr: ${{ inputs.comment-on-pr && 'true' || 'false' }}
+          max-file-lines: ${{ inputs.max-file-lines }}
+          chunk-size: ${{ inputs.chunk-size }}
+
+  drift-score:
+    name: Drift Score
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute drift score
+        uses: archyl-com/actions/drift-score@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          api-key: ${{ secrets.api-key }}
+          organization-id: ${{ inputs.organization-id }}
+          project-id: ${{ inputs.project-id }}
+          threshold: ${{ inputs.drift-threshold }}
+          comment-on-pr: ${{ inputs.comment-on-pr && 'true' || 'false' }}

@@ -1,0 +1,48 @@
+name: 'Archyl Generate Context'
+description: 'Generate an archyl.txt file with architecture context optimized for AI agents (LLMs)'
+branding:
+  icon: 'file-text'
+  color: 'purple'
+
+inputs:
+  api-url:
+    description: 'Archyl API base URL'
+    required: false
+    default: 'https://api.archyl.com'
+  api-key:
+    description: 'Archyl API key with read scope'
+    required: true
+  organization-id:
+    description: 'Archyl organization UUID'
+    required: true
+  project-id:
+    description: 'Archyl project UUID'
+    required: true
+  output-file:
+    description: 'Path to write the generated context file'
+    required: false
+    default: 'archyl.txt'
+  format:
+    description: 'Output format: "markdown" for LLM-optimized briefing, "full" for structured JSON + markdown'
+    required: false
+    default: 'markdown'
+  commit:
+    description: 'Auto-commit the generated file if it changed'
+    required: false
+    default: 'false'
+  commit-message:
+    description: 'Commit message when auto-committing'
+    required: false
+    default: 'chore: update archyl.txt architecture context'
+
+outputs:
+  file-path:
+    description: 'Path to the generated context file'
+  changed:
+    description: 'Whether the file content changed ("true" or "false")'
+  token-count:
+    description: 'Approximate token count of the generated file'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'

@@ -1,0 +1,105 @@
+name: Archyl Main
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: 'Archyl API base URL'
+        type: string
+        required: false
+        default: 'https://api.archyl.com'
+      organization-id:
+        description: 'Archyl organization UUID'
+        type: string
+        required: true
+      project-id:
+        description: 'Archyl project UUID'
+        type: string
+        required: true
+      generate-context:
+        description: 'Generate and auto-commit archyl.txt'
+        type: boolean
+        required: false
+        default: true
+      context-format:
+        description: 'Context output format: "markdown" or "full"'
+        type: string
+        required: false
+        default: 'markdown'
+      sync:
+        description: 'Sync archyl.yaml to Archyl'
+        type: boolean
+        required: false
+        default: false
+      sync-file:
+        description: 'Path to the archyl.yaml file'
+        type: string
+        required: false
+        default: 'archyl.yaml'
+      release:
+        description: 'Create a release in Archyl'
+        type: boolean
+        required: false
+        default: false
+      release-status:
+        description: 'Release status: planned, in_progress, deployed, rolled_back, failed'
+        type: string
+        required: false
+        default: 'deployed'
+      release-environment:
+        description: 'Target environment name for the release'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      api-key:
+        description: 'Archyl API key with write scope'
+        required: true
+
+jobs:
+  generate-context:
+    name: Generate Context
+    if: ${{ inputs.generate-context }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate archyl.txt
+        uses: archyl-com/actions/generate-context@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          api-key: ${{ secrets.api-key }}
+          organization-id: ${{ inputs.organization-id }}
+          project-id: ${{ inputs.project-id }}
+          format: ${{ inputs.context-format }}
+          commit: 'true'
+
+  sync:
+    name: Sync Architecture
+    if: ${{ inputs.sync }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync archyl.yaml
+        uses: archyl-com/actions/sync@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          api-key: ${{ secrets.api-key }}
+          project-id: ${{ inputs.project-id }}
+          file: ${{ inputs.sync-file }}
+
+  release:
+    name: Track Release
+    if: ${{ inputs.release }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release
+        uses: archyl-com/actions/release@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          api-key: ${{ secrets.api-key }}
+          project-id: ${{ inputs.project-id }}
+          status: ${{ inputs.release-status }}
+          environment: ${{ inputs.release-environment }}
+          source-url: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}

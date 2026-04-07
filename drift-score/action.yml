@@ -30,6 +30,14 @@ inputs:
     description: 'Maximum seconds to wait for computation to complete'
     required: false
     default: '300'
+  comment-on-pr:
+    description: 'Post a summary comment on the pull request (requires GITHUB_TOKEN)'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'GitHub token for PR comments (defaults to GITHUB_TOKEN)'
+    required: false
+    default: '${{ github.token }}'
 
 outputs:
   score:

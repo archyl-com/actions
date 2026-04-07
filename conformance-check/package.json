@@ -1,8 +1,8 @@
 {
-  "name": "@archyl/drift-score-action",
+  "name": "@archyl/conformance-check-action",
   "version": "1.0.0",
   "private": true,
-  "description": "Compute architecture drift score in Archyl from your CI pipeline",
+  "description": "Run architecture conformance rules against changed files in CI",
   "main": "dist/index.js",
   "scripts": {
     "build": "ncc build src/index.js -o dist --source-map --license licenses.txt"

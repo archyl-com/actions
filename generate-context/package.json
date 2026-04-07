@@ -1,15 +1,15 @@
 {
-  "name": "@archyl/drift-score-action",
+  "name": "@archyl/generate-context-action",
   "version": "1.0.0",
   "private": true,
-  "description": "Compute architecture drift score in Archyl from your CI pipeline",
+  "description": "Generate an archyl.txt architecture context file for AI agents",
   "main": "dist/index.js",
   "scripts": {
     "build": "ncc build src/index.js -o dist --source-map --license licenses.txt"
   },
   "dependencies": {
     "@actions/core": "^1.11.1",
-    "@actions/github": "^6.0.0",
+    "@actions/exec": "^1.1.1",
     "@actions/http-client": "^2.2.3"
   },
   "devDependencies": {

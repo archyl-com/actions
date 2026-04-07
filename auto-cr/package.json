@@ -1,8 +1,8 @@
 {
-  "name": "@archyl/drift-score-action",
+  "name": "@archyl/auto-cr-action",
   "version": "1.0.0",
   "private": true,
-  "description": "Compute architecture drift score in Archyl from your CI pipeline",
+  "description": "Automatically create Architecture Change Requests in Archyl when code is merged",
   "main": "dist/index.js",
   "scripts": {
     "build": "ncc build src/index.js -o dist --source-map --license licenses.txt"
