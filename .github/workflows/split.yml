@@ -1,0 +1,57 @@
+name: Monorepo Split
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+env:
+  GITHUB_TOKEN: ${{ secrets.SPLIT_TOKEN }}
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - local_path: 'conformance-check'
+            split_repository: 'conformance-check'
+          - local_path: 'drift-score'
+            split_repository: 'drift-score'
+          - local_path: 'generate-context'
+            split_repository: 'generate-context'
+          - local_path: 'auto-cr'
+            split_repository: 'auto-cr'
+          - local_path: 'release'
+            split_repository: 'release-action'
+          - local_path: 'sync'
+            split_repository: 'sync-action'
+
+    name: Split ${{ matrix.package.local_path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Split on branch push (no tag)
+      - if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: danharrin/monorepo-split-github-action@v2.3.0
+        with:
+          package_directory: '${{ matrix.package.local_path }}'
+          repository_organization: 'archyl-com'
+          repository_name: '${{ matrix.package.split_repository }}'
+          user_name: 'archyl-bot'
+          user_email: 'bot@archyl.com'
+
+      # Split on tag push (with tag forwarding)
+      - if: "startsWith(github.ref, 'refs/tags/')"
+        uses: danharrin/monorepo-split-github-action@v2.3.0
+        with:
+          package_directory: '${{ matrix.package.local_path }}'
+          repository_organization: 'archyl-com'
+          repository_name: '${{ matrix.package.split_repository }}'
+          user_name: 'archyl-bot'
+          user_email: 'bot@archyl.com'
+          tag: ${{ github.ref_name }}
