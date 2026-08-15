@@ -24,8 +24,11 @@ async function run() {
   // Step 1: Fetch agent context from Archyl
   core.info("Fetching architecture context from Archyl...");
 
-  const contextUrl = `${apiUrl}/api/v1/projects/${projectId}/agent-context`;
-  const response = await http.postJson(contextUrl, { format }, headers);
+  // The API returns the structured context (including the markdown briefing) as
+  // JSON. `format=markdown` would return raw text/markdown instead, so we always
+  // ask for the full payload and render the requested format locally.
+  const contextUrl = `${apiUrl}/api/v1/projects/${projectId}/agent/context?format=full`;
+  const response = await http.getJson(contextUrl, headers);
 
   if (response.statusCode < 200 || response.statusCode >= 300) {
     core.setFailed(`Failed to fetch agent context: ${response.statusCode} ${JSON.stringify(response.result)}`);

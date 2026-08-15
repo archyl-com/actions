@@ -43,7 +43,7 @@ archyl:conformance:
       done
 
       # Get changed files from the merge request diff
-      CHANGED_FILES=$(git diff --name-status "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}...HEAD" | awk '{print $2}')
+      CHANGED_FILES=$(git diff --name-status "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}...HEAD")
 
       if [ -z "$CHANGED_FILES" ]; then
         echo "No changed files detected. Skipping conformance check."
@@ -53,84 +53,66 @@ archyl:conformance:
       echo "Changed files:"
       echo "$CHANGED_FILES"
 
-      # Build file contents payload
-      FILE_CONTENTS="[]"
+      # Build the payload: changedFiles is a list of {path, status}, fileContents
+      # is a path -> content map.
       CHANGED_FILES_JSON="[]"
+      FILE_CONTENTS="{}"
 
-      while IFS= read -r file; do
-        if [ -f "$file" ]; then
-          CONTENT=$(head -200 "$file" | jq -Rs .)
-          FILE_CONTENTS=$(echo "$FILE_CONTENTS" | jq --arg path "$file" --argjson content "$CONTENT" '. + [{"path": $path, "content": $content}]')
+      while read -r LETTER FILE_PATH RENAMED_PATH; do
+        [ -n "${RENAMED_PATH:-}" ] && FILE_PATH="$RENAMED_PATH"
+        [ -z "${FILE_PATH:-}" ] && continue
+
+        case "$LETTER" in
+          A*) STATUS="added" ;;
+          D*) STATUS="deleted" ;;
+          *)  STATUS="modified" ;;
+        esac
+
+        CHANGED_FILES_JSON=$(printf '%s\n' "$CHANGED_FILES_JSON" | jq --arg path "$FILE_PATH" --arg status "$STATUS" '. + [{path: $path, status: $status}]')
+
+        if [ "$STATUS" != "deleted" ] && [ -f "$FILE_PATH" ]; then
+          CONTENT=$(head -200 "$FILE_PATH")
+          FILE_CONTENTS=$(printf '%s\n' "$FILE_CONTENTS" | jq --arg path "$FILE_PATH" --arg content "$CONTENT" '. + {($path): $content}')
         fi
-        CHANGED_FILES_JSON=$(echo "$CHANGED_FILES_JSON" | jq --arg path "$file" '. + [$path]')
       done <<EOF
       $CHANGED_FILES
       EOF
 
-      # Trigger conformance check
+      # Run the conformance check. The API evaluates the diff and returns the
+      # full report in the response — there is nothing to poll.
       RESPONSE=$(curl -sf -w "\n%{http_code}" \
-        -X POST "${ARCHYL_API_URL}/api/v1/conformance/check" \
+        -X POST "${ARCHYL_API_URL}/api/v1/projects/${ARCHYL_PROJECT_ID}/conformance/check" \
         -H "Content-Type: application/json" \
         -H "X-API-Key: ${ARCHYL_API_KEY}" \
         -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
         -d "$(jq -n \
-          --arg projectId "$ARCHYL_PROJECT_ID" \
+          --arg commitSha "$CI_COMMIT_SHA" \
+          --arg branch "$CI_COMMIT_REF_NAME" \
           --argjson changedFiles "$CHANGED_FILES_JSON" \
           --argjson fileContents "$FILE_CONTENTS" \
-          '{projectId: $projectId, changedFiles: $changedFiles, fileContents: $fileContents}'
+          '{commitSha: $commitSha, branch: $branch, changedFiles: $changedFiles, fileContents: $fileContents}'
         )" 2>&1) || true
 
-      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-      BODY=$(echo "$RESPONSE" | sed '$d')
+      HTTP_CODE=$(printf '%s\n' "$RESPONSE" | tail -1)
+      REPORT=$(printf '%s\n' "$RESPONSE" | sed '$d')
 
       if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
         echo "ERROR: Conformance check API returned HTTP $HTTP_CODE"
-        echo "$BODY"
+        printf '%s\n' "$REPORT"
         exit 1
       fi
 
-      CHECK_ID=$(echo "$BODY" | jq -r '.checkId // .id // empty')
+      echo "Check ID: $(printf '%s\n' "$REPORT" | jq -r '.check.id // "unknown"')"
 
-      if [ -z "$CHECK_ID" ]; then
-        echo "ERROR: No check ID returned from API"
-        echo "$BODY"
-        exit 1
-      fi
-
-      echo "Check ID: $CHECK_ID"
-
-      # Poll for report
-      MAX_ATTEMPTS=60
-      ATTEMPT=0
-
-      while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-        REPORT=$(curl -sf \
-          -H "X-API-Key: ${ARCHYL_API_KEY}" \
-          -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
-          "${ARCHYL_API_URL}/api/v1/conformance/${CHECK_ID}/report" 2>&1) || true
-
-        STATUS=$(echo "$REPORT" | jq -r '.status // "pending"')
-
-        if [ "$STATUS" = "completed" ] || [ "$STATUS" = "done" ]; then
-          break
-        fi
-
-        ATTEMPT=$((ATTEMPT + 1))
-        sleep 5
-      done
-
-      if [ "$STATUS" != "completed" ] && [ "$STATUS" != "done" ]; then
-        echo "ERROR: Conformance check timed out after $((MAX_ATTEMPTS * 5))s"
-        exit 1
-      fi
-
-      # Extract results
-      TOTAL=$(echo "$REPORT" | jq -r '.totalViolations // (.violations | length) // 0')
-      ERRORS=$(echo "$REPORT" | jq -r '.errors // ([.violations[]? | select(.severity == "error")] | length) // 0')
-      WARNINGS=$(echo "$REPORT" | jq -r '.warnings // ([.violations[]? | select(.severity == "warning")] | length) // 0')
+      # Extract results. Archyl grades violations critical/high/medium/low, and
+      # counts a check as failed when there is at least one critical or high.
+      TOTAL=$(printf '%s\n' "$REPORT" | jq -r '.summary.total // 0')
+      PASSED=$(printf '%s\n' "$REPORT" | jq -r '.summary.passed // true')
+      ERRORS=$(printf '%s\n' "$REPORT" | jq -r '(.summary.critical // 0) + (.summary.high // 0)')
+      WARNINGS=$(printf '%s\n' "$REPORT" | jq -r '.summary.medium // 0')
 
       echo ""
-      echo "Results: $TOTAL violation(s) ($ERRORS error(s), $WARNINGS warning(s))"
+      echo "Results: $TOTAL violation(s) ($ERRORS critical/high, $WARNINGS medium)"
 
       # Build MR comment
       COMMENT="## Archyl Conformance Check\n\n"
@@ -138,12 +120,12 @@ archyl:conformance:
       if [ "$TOTAL" -eq 0 ]; then
         COMMENT="${COMMENT}All conformance rules passed.\n"
       else
-        COMMENT="${COMMENT}| Severity | Count |\n|----------|-------|\n"
-        COMMENT="${COMMENT}| Errors   | $ERRORS |\n"
-        COMMENT="${COMMENT}| Warnings | $WARNINGS |\n\n"
+        COMMENT="${COMMENT}| Severity | Count |\n|---------------|-------|\n"
+        COMMENT="${COMMENT}| Critical/High | $ERRORS |\n"
+        COMMENT="${COMMENT}| Medium        | $WARNINGS |\n\n"
 
         # List violations
-        VIOLATIONS=$(echo "$REPORT" | jq -r '.violations[]? | "- **\(.severity)**: \(.message) (`\(.file // "N/A")`)"')
+        VIOLATIONS=$(printf '%s\n' "$REPORT" | jq -r '.violations[]? | "- **\(.severity)**: \(.title) (`\(.filePath // "N/A")`)"')
         if [ -n "$VIOLATIONS" ]; then
           COMMENT="${COMMENT}### Violations\n\n${VIOLATIONS}\n"
         fi
@@ -163,9 +145,9 @@ archyl:conformance:
           -d @- > /dev/null 2>&1 || echo "WARNING: Failed to post MR comment"
       fi
 
-      # Fail on errors
-      if [ "$ERRORS" -gt 0 ]; then
-        echo "FAILED: $ERRORS conformance error(s) found"
+      # Fail on critical or high violations
+      if [ "$PASSED" != "true" ]; then
+        echo "FAILED: $ERRORS critical/high conformance violation(s) found"
         exit 1
       fi
 
@@ -198,20 +180,20 @@ archyl:drift-score:
         -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
         -d "$(jq -n --arg projectId "$ARCHYL_PROJECT_ID" '{projectId: $projectId}')" 2>&1) || true
 
-      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-      BODY=$(echo "$RESPONSE" | sed '$d')
+      HTTP_CODE=$(printf '%s\n' "$RESPONSE" | tail -1)
+      BODY=$(printf '%s\n' "$RESPONSE" | sed '$d')
 
       if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
         echo "ERROR: Drift compute API returned HTTP $HTTP_CODE"
-        echo "$BODY"
+        printf '%s\n' "$BODY"
         exit 1
       fi
 
-      SCORE_ID=$(echo "$BODY" | jq -r '.scoreId // .id // empty')
+      SCORE_ID=$(printf '%s\n' "$BODY" | jq -r '.scoreId // .id // empty')
 
       if [ -z "$SCORE_ID" ]; then
         echo "ERROR: No score ID returned from API"
-        echo "$BODY"
+        printf '%s\n' "$BODY"
         exit 1
       fi
 
@@ -312,32 +294,30 @@ archyl:generate-context:
 
       # Fetch architecture context
       RESPONSE=$(curl -sf -w "\n%{http_code}" \
-        -X POST "${ARCHYL_API_URL}/api/v1/projects/${ARCHYL_PROJECT_ID}/agent-context" \
-        -H "Content-Type: application/json" \
+        "${ARCHYL_API_URL}/api/v1/projects/${ARCHYL_PROJECT_ID}/agent/context?format=full" \
         -H "X-API-Key: ${ARCHYL_API_KEY}" \
-        -H "X-Organization-ID: ${ARCHYL_ORG_ID}" \
-        -d '{"format": "markdown"}' 2>&1) || true
+        -H "X-Organization-ID: ${ARCHYL_ORG_ID}" 2>&1) || true
 
-      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-      BODY=$(echo "$RESPONSE" | sed '$d')
+      HTTP_CODE=$(printf '%s\n' "$RESPONSE" | tail -1)
+      BODY=$(printf '%s\n' "$RESPONSE" | sed '$d')
 
       if [ "$HTTP_CODE" != "200" ]; then
         echo "ERROR: Agent context API returned HTTP $HTTP_CODE"
-        echo "$BODY"
+        printf '%s\n' "$BODY"
         exit 1
       fi
 
-      # Extract content and write to file
-      CONTENT=$(echo "$BODY" | jq -r '.content // .context // empty')
+      # Extract the markdown briefing and write it to file
+      CONTENT=$(printf '%s\n' "$BODY" | jq -r '.markdown // empty')
 
       if [ -z "$CONTENT" ]; then
         echo "ERROR: No context content returned"
-        echo "$BODY"
+        printf '%s\n' "$BODY"
         exit 1
       fi
 
       OUTPUT_FILE="${ARCHYL_CONTEXT_FILE:-archyl.txt}"
-      echo "$CONTENT" > "$OUTPUT_FILE"
+      printf '%s\n' "$CONTENT" > "$OUTPUT_FILE"
 
       echo "Generated $OUTPUT_FILE ($(wc -c < "$OUTPUT_FILE") bytes)"
 

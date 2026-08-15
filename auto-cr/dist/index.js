@@ -31946,13 +31946,13 @@ async function run() {
   // Step 3: Fetch current C4 model from Archyl
   core.info("Fetching current C4 model from Archyl...");
 
-  let c4Model = null;
+  let agentContext = null;
   try {
-    const contextUrl = `${apiUrl}/api/v1/projects/${projectId}/agent-context`;
-    const contextResponse = await http.postJson(contextUrl, { format: "full" }, headers);
+    const contextUrl = `${apiUrl}/api/v1/projects/${projectId}/agent/context?format=full`;
+    const contextResponse = await http.getJson(contextUrl, headers);
 
     if (contextResponse.statusCode >= 200 && contextResponse.statusCode < 300) {
-      c4Model = contextResponse.result;
+      agentContext = contextResponse.result;
     } else {
       core.warning(`Failed to fetch C4 model (${contextResponse.statusCode}). Proceeding without element matching.`);
     }
@@ -31961,13 +31961,14 @@ async function run() {
   }
 
   // Step 4: Match changes against C4 elements
-  const matchedElements = c4Model ? matchAgainstModel(archChanges, c4Model) : [];
+  const elements = extractElements(agentContext);
+  const matchedElements = matchAgainstModel(archChanges, elements);
 
   // Step 5: Build Change Request description
   const description = buildDescription(archChanges, matchedElements, diff, before, after);
 
   // Step 6: Build suggested changes for the CR
-  const suggestedChanges = buildSuggestedChanges(archChanges, matchedElements);
+  const suggestedChanges = buildSuggestedChanges(archChanges, matchedElements, elements);
 
   // Step 7: Create the Change Request via API
   core.info("Creating Change Request in Archyl...");
@@ -31978,7 +31979,6 @@ async function run() {
     const crBody = {
       title: `Auto-detected architecture changes from ${after.substring(0, 7)}`,
       description,
-      type: "architecture_update",
     };
 
     const crResponse = await http.postJson(crUrl, crBody, headers);
@@ -31989,7 +31989,7 @@ async function run() {
       return;
     }
 
-    requestId = crResponse.result && crResponse.result.id;
+    requestId = crResponse.result && crResponse.result.data && crResponse.result.data.id;
     if (!requestId) {
       core.setFailed("No request ID returned from Change Request creation");
       core.setOutput("status", "failed");
@@ -32003,20 +32003,28 @@ async function run() {
     return;
   }
 
-  // Step 8: Add changes to the CR
-  if (suggestedChanges.length > 0) {
-    try {
-      const changesUrl = `${apiUrl}/api/v1/projects/${projectId}/requests/${requestId}/changes`;
-      const changesResponse = await http.postJson(changesUrl, { changes: suggestedChanges }, headers);
+  // Step 8: Add changes to the CR. The API takes one change per call.
+  let addedChanges = 0;
+  const changesUrl = `${apiUrl}/api/v1/requests/${requestId}/changes`;
 
-      if (changesResponse.statusCode >= 200 && changesResponse.statusCode < 300) {
-        core.info(`Added ${suggestedChanges.length} suggested changes to the CR.`);
+  for (const change of suggestedChanges) {
+    try {
+      const changeResponse = await http.postJson(changesUrl, change, headers);
+
+      if (changeResponse.statusCode >= 200 && changeResponse.statusCode < 300) {
+        addedChanges++;
       } else {
-        core.warning(`Failed to add changes to CR: ${changesResponse.statusCode}`);
+        core.warning(
+          `Failed to add change for ${change.elementType} "${change.elementData.name || change.elementId}": ${changeResponse.statusCode}`
+        );
       }
     } catch (err) {
-      core.warning(`Failed to add changes to CR: ${err.message}`);
+      core.warning(`Failed to add change to CR: ${err.message}`);
     }
+  }
+
+  if (addedChanges > 0) {
+    core.info(`Added ${addedChanges} suggested change(s) to the CR.`);
   }
 
   // Step 9: Set outputs
@@ -32029,7 +32037,7 @@ async function run() {
   core.info("====================================");
   core.info(`  Change Request created: ${requestId}`);
   core.info(`  Architecture changes:   ${archChanges.length}`);
-  core.info(`  Suggested CR changes:   ${suggestedChanges.length}`);
+  core.info(`  Suggested CR changes:   ${addedChanges}`);
   core.info("====================================");
   core.info("");
 
@@ -32053,7 +32061,7 @@ async function run() {
       ...summaryRows,
     ])
     .addRaw(`\n**Total architecture-relevant changes:** ${archChanges.length}\n`)
-    .addRaw(`**Suggested element updates:** ${suggestedChanges.length}\n\n`)
+    .addRaw(`**Suggested element updates:** ${addedChanges}\n\n`)
     .addRaw("---\n*Powered by [Archyl](https://archyl.com) — Architecture Intelligence for AI-Native Teams*\n")
     .write();
 
@@ -32140,11 +32148,8 @@ function detectArchitectureChanges(files) {
 /**
  * Match detected changes against the current C4 model elements.
  */
-function matchAgainstModel(archChanges, c4Model) {
+function matchAgainstModel(archChanges, elements) {
   const matched = [];
-
-  // Extract element names from the model for fuzzy matching
-  const elements = extractElements(c4Model);
 
   for (const change of archChanges) {
     const pathParts = change.file.split("/").filter(Boolean);
@@ -32169,33 +32174,34 @@ function matchAgainstModel(archChanges, c4Model) {
 }
 
 /**
- * Extract all named elements from the C4 model response.
+ * Extract all named elements from the agent context response. `elementType` is the
+ * C4 level the element sits at, which is what the Change Request API expects;
+ * `type` is the element's own kind (database, application, ...) and is display only.
  */
-function extractElements(c4Model) {
+function extractElements(agentContext) {
+  const model = (agentContext && agentContext.c4Model) || {};
   const elements = [];
 
-  if (!c4Model) return elements;
+  const levels = [
+    ["system", model.systems],
+    ["container", model.containers],
+    ["component", model.components],
+  ];
 
-  const walk = (obj) => {
-    if (!obj || typeof obj !== "object") return;
-    if (Array.isArray(obj)) {
-      for (const item of obj) walk(item);
-      return;
-    }
-    if (obj.name && obj.type) {
+  for (const [elementType, list] of levels) {
+    for (const element of list || []) {
+      if (!element.name) continue;
       elements.push({
-        name: obj.name,
-        type: obj.type,
-        id: obj.id,
-        description: obj.description,
+        id: element.id,
+        name: element.name,
+        type: element.type,
+        elementType,
+        description: element.description,
+        isExternal: element.isExternal === true,
       });
     }
-    for (const val of Object.values(obj)) {
-      if (typeof val === "object") walk(val);
-    }
-  };
+  }
 
-  walk(c4Model);
   return elements;
 }
 
@@ -32238,68 +32244,89 @@ function buildDescription(archChanges, matchedElements, diff, before, after) {
 }
 
 /**
- * Build structured changes for the CR API.
+ * Build structured changes for the CR API. Each entry is one `POST /requests/:id/changes`
+ * body: an operation, the C4 level it applies to, and the element payload.
+ *
+ * Only changes the API can actually apply on merge are emitted: a create needs its
+ * parent element, and an update or a delete needs the ID of an existing element.
+ * Everything else stays in the CR description for the reviewer to act on.
  */
-function buildSuggestedChanges(archChanges, matchedElements) {
+function buildSuggestedChanges(archChanges, matchedElements, elements) {
   const changes = [];
+  const primarySystem = elements.find((e) => e.elementType === "system" && !e.isExternal);
+  const elementsByName = new Map(elements.map((e) => [e.name.toLowerCase(), e]));
 
   for (const change of archChanges) {
+    const elementName = extractServiceName(change.file);
+    const existing = elementsByName.get(elementName.toLowerCase());
+
     if (change.status === "added" && (change.category === "container" || change.category === "service")) {
-      const dirName = extractServiceName(change.file);
+      if (existing || !primarySystem) continue;
       changes.push({
-        type: "create",
+        operation: "create",
         elementType: "container",
-        elementName: dirName,
-        description: `New ${change.label} detected: \`${change.file}\``,
+        elementData: {
+          name: elementName,
+          description: `New ${change.label} detected: \`${change.file}\``,
+          containerType: "service",
+          systemId: primarySystem.id,
+        },
       });
     } else if (change.status === "removed" && (change.category === "container" || change.category === "service")) {
-      const dirName = extractServiceName(change.file);
+      if (!existing) continue;
       changes.push({
-        type: "delete",
-        elementType: "container",
-        elementName: dirName,
-        description: `Removed ${change.label}: \`${change.file}\``,
-      });
-    } else if (change.category === "api") {
-      changes.push({
-        type: change.status === "added" ? "create" : "update",
-        elementType: "relationship",
-        elementName: extractServiceName(change.file),
-        description: `${change.status === "added" ? "New" : "Modified"} API contract: \`${change.file}\``,
-      });
-    } else if (change.category === "event") {
-      changes.push({
-        type: change.status === "added" ? "create" : "update",
-        elementType: "relationship",
-        elementName: extractServiceName(change.file),
-        description: `${change.status === "added" ? "New" : "Modified"} event/messaging config: \`${change.file}\``,
+        operation: "delete",
+        elementType: existing.elementType,
+        elementId: existing.id,
+        elementData: {},
       });
     } else if (change.category === "dependency" && change.status === "added") {
+      const container = findParentContainer(change.file, elements);
+      if (existing || !container) continue;
       changes.push({
-        type: "create",
+        operation: "create",
         elementType: "component",
-        elementName: extractServiceName(change.file),
-        description: `New dependency manifest detected: \`${change.file}\``,
+        elementData: {
+          name: elementName,
+          description: `New dependency manifest detected: \`${change.file}\``,
+          componentType: "module",
+          containerId: container.id,
+        },
       });
     }
+    // API contract and event/messaging changes are reported in the description only:
+    // a relationship needs source and target element IDs, which a file diff cannot give.
   }
 
   // Add updates for matched elements
+  const updated = new Set();
+
   for (const match of matchedElements) {
-    const alreadyTracked = changes.some(
-      (c) => c.elementName.toLowerCase() === match.element.name.toLowerCase()
-    );
-    if (!alreadyTracked) {
-      changes.push({
-        type: "update",
-        elementType: match.element.type,
-        elementName: match.element.name,
+    if (!match.element.id || updated.has(match.element.id)) continue;
+    updated.add(match.element.id);
+    changes.push({
+      operation: "update",
+      elementType: match.element.elementType,
+      elementId: match.element.id,
+      elementData: {
         description: `Modified file \`${match.change.file}\` affects this element`,
-      });
-    }
+      },
+    });
   }
 
   return changes;
+}
+
+/**
+ * Find the container a file most likely belongs to, by matching its path segments
+ * against known container names.
+ */
+function findParentContainer(filepath, elements) {
+  const parts = filepath.split("/").filter(Boolean).map((p) => p.toLowerCase());
+
+  return elements.find(
+    (e) => e.elementType === "container" && parts.includes(e.name.toLowerCase())
+  );
 }
 
 /**
