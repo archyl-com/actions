@@ -2,6 +2,10 @@
 
 Automatically sync your `archyl.yaml` architecture file with Archyl whenever it changes.
 
+The action sends `archyl.yaml` with every file its `include` directives reach
+and every file a doc or API contract names with `file:` (a path from the
+repository root). A file that is missing fails the step.
+
 ## Usage
 
 ### On push to main
