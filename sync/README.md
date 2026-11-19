@@ -38,6 +38,29 @@ jobs:
     file: 'docs/archyl.yaml'
 ```
 
+### Deleting what the file no longer declares
+
+By default a sync only creates and updates. With `prune: true` it also deletes
+what the project has and the file no longer declares:
+
+```yaml
+- uses: archyl-com/actions/sync@v1
+  with:
+    api-key: ${{ secrets.ARCHYL_API_KEY }}
+    project-id: 'your-project-uuid'
+    prune: true
+```
+
+- Only the kinds of object the file declares are pruned: systems, containers,
+  components, code, relationships, decisions, docs and API contracts. A file
+  with no `docs` section never deletes a doc.
+- Deleting an element deletes its children and its relationships.
+- The server refuses a prune that would delete at least 10 objects and more
+  than 30 % of a kind, which is what a truncated file looks like. Nothing is
+  synced then, and the step fails. `force: true` lets it through.
+- The `pruned` output holds the number of objects deleted, and each one is
+  listed in the log.
+
 ### Monorepo with multiple projects
 
 ```yaml

@@ -19,6 +19,14 @@ inputs:
     description: 'Path to the archyl.yaml file relative to the repository root'
     required: false
     default: 'archyl.yaml'
+  prune:
+    description: 'Delete what the project has and the file no longer declares, for each kind of object the file declares'
+    required: false
+    default: 'false'
+  force:
+    description: 'With prune, delete even a large share of the project (the server refuses it otherwise)'
+    required: false
+    default: 'false'
 
 outputs:
   systems-created:
@@ -29,6 +37,8 @@ outputs:
     description: 'Number of components created'
   relationships-created:
     description: 'Number of relationships created'
+  pruned:
+    description: 'Number of objects deleted by the prune'
   summary:
     description: 'Human-readable summary of the sync result'
 
